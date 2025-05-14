@@ -12,8 +12,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import PydanticOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.chains import LLMChain
+from collections import defaultdict, deque
+from datetime import datetime
 import json
 import dotenv
+
+
+
+
+
+
 dotenv.load_dotenv()
 # Khởi tạo FastAPI app
 app = FastAPI(title="Sex Education Chatbot API - Powered by GPT-4o-mini")
@@ -27,13 +35,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+chat_histories = defaultdict(lambda: deque(maxlen=3))
+
 # Định nghĩa các model dữ liệu
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatHistoryEntry(BaseModel):
+    timestamp: str
+    user_message: str
+    bot_response: str
+    user_age_group: str
+    user_gender: str
+
 class ChatRequest(BaseModel):
     message: str
     user_age_group: str  # 'child', 'teen', 'adult', 'parent'
     user_gender: Literal["male", "female"]
     context: Optional[List[Dict[str, str]]] = []
     session_id: Optional[str] = None
+    use_history: Optional[bool] = True
 
 class ChatResponse(BaseModel):
     response: str
@@ -48,11 +71,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")  # Replace with your actua
 conversation_memories = {}
 # Cơ sở dữ liệu giả lập để lưu trữ câu hỏi và câu trả lời
 
-# Các từ khóa nhạy cảm để lọc nội dung không phù hợp
-sensitive_keywords = [
-    "khiêu dâm", "ảnh sex", "phim sex", "bạo lực tình dục", "lạm dụng",
-    "ngược đãi", "kích dục", "gợi tình", "gợi cảm", "gạ gẫm"
-]
 
 # Định nghĩa hướng dẫn hệ thống cho từng nhóm tuổi và giới tính
 age_gender_prompts = {
@@ -231,16 +249,6 @@ Câu hỏi của người dùng: {question}
 
 # Function calling prompt để xác định câu hỏi có liên quan đến giáo dục giới tính không
 # Hàm để kiểm tra sự phù hợp của nội dung
-def is_content_appropriate(message: str, user_age_group: str) -> bool:
-    message_lower = message.lower()
-    
-    # Kiểm tra từ khóa nhạy cảm trong tin nhắn
-    for keyword in sensitive_keywords:
-        if keyword in message_lower:
-            return False
-    
-    return True
-
 
 class MessageTypeResponse(BaseModel):
     is_sex_education_related: bool = Field(
@@ -289,15 +297,64 @@ message_type_prompt = ChatPromptTemplate.from_messages(
 ).partial(format_instructions=message_type_parser.get_format_instructions())
 
 # Hàm để xác định loại tin nhắn của người dùng
-async def classify_message_type(message: str) -> dict:
+async def classify_message_type(message: str, session_id: str = None, use_history: bool = True) -> dict:
     llm = ChatOpenAI(
         openai_api_key=OPENAI_API_KEY,
         model="gpt-4o-mini",
         temperature=0.1
     )
-    try: 
-        chain = message_type_prompt | llm | message_type_parser
-        response = chain.invoke({"question": message})
+    
+    try:
+        # Tạo prompt với lịch sử chat nếu được yêu cầu và có session_id
+        chat_history_text = ""
+        if use_history and session_id and session_id in chat_histories and len(chat_histories[session_id]) > 0:
+            chat_history_text = "Lịch sử hội thoại gần đây (3 tin nhắn gần nhất):\n"
+            for idx, entry in enumerate(chat_histories[session_id]):
+                chat_history_text += f"Người dùng: {entry.user_message}\n"
+                chat_history_text += f"Chatbot: {entry.bot_response}\n\n"
+        
+        # Tạo prompt hoàn chỉnh với lịch sử chat
+        system_message = """Bạn cần phân loại câu hỏi của người dùng vào một trong các loại sau:
+         
+         1. Liên quan đến giáo dục giới tính
+         Các chủ đề liên quan đến giáo dục giới tính bao gồm nhưng không giới hạn:
+         - Cơ thể con người và sự phát triển (dậy thì, các bộ phận cơ thể, thay đổi cơ thể)
+         - Sức khỏe sinh sản (kinh nguyệt, mãn kinh, tinh hoàn, xuất tinh, sức khỏe tuyến tiền liệt)
+         - Mối quan hệ tình cảm và tình dục (mối quan hệ lành mạnh, đồng thuận, giao tiếp)
+         - Bệnh lây truyền qua đường tình dục (HIV/AIDS, bệnh lây qua đường tình dục, phòng ngừa)
+         - Phương pháp tránh thai và kế hoạch hóa gia đình
+         - Định hướng tính dục và bản dạng giới
+         - Vấn đề ranh giới cá nhân và tôn trọng
+         
+         2. Là lời chào hỏi hoặc tạm biệt
+         Các câu chào hỏi/tạm biệt có thể là:
+         - Xin chào, chào bạn, hello, hi, hey
+         - Tạm biệt, goodbye, bye, see you
+         - Chúc ngày tốt lành, chúc buổi sáng/chiều/tối tốt lành
+         - Cảm ơn bạn, thank you, cảm ơn vì đã giúp đỡ
+         - Và các biến thể khác của lời chào/tạm biệt
+         
+         3. Không liên quan đến giáo dục giới tính và không phải lời chào hỏi/tạm biệt
+         
+         Trả về JSON với định dạng:
+         {format_instructions}
+         """
+        
+        # Nếu có lịch sử chat, thêm vào prompt
+        if chat_history_text:
+            system_message += f"\n\n{chat_history_text}\n"
+            system_message += f"Câu hỏi mới của người dùng cần phân loại: {message}"
+        else:
+            system_message += f"\n\nCâu hỏi của người dùng: {message}"
+        
+        # Tạo message prompt với lịch sử chat
+        message_prompt = ChatPromptTemplate.from_messages([
+            ("system", system_message)
+        ]).partial(format_instructions=message_type_parser.get_format_instructions())
+        
+        # Thực hiện phân loại
+        chain = message_prompt | llm | message_type_parser
+        response = chain.invoke({})
         return response.model_dump()
     except Exception as e:
         print(f"Error in message classification: {e}")
@@ -306,6 +363,7 @@ async def classify_message_type(message: str) -> dict:
             "is_greeting": False,
             "reason": f"Lỗi phân loại: {str(e)}"
         }
+
 
 # Hàm xử lý lời chào hỏi
 async def handle_greeting(message: str, user_age_group: str, user_gender: str = None) -> dict:
@@ -336,7 +394,7 @@ async def handle_greeting(message: str, user_age_group: str, user_gender: str = 
         llm = ChatOpenAI(
             openai_api_key=OPENAI_API_KEY,
             model="gpt-4o-mini",
-            temperature=0.7
+            temperature=0.7,
         )
         
         prompt_template = PromptTemplate(
@@ -365,14 +423,7 @@ async def handle_greeting(message: str, user_age_group: str, user_gender: str = 
         }
 
 # Sửa đổi hàm xử lý tin nhắn sử dụng LangChain và GPT-4o-mini
-async def process_message_with_langchain(message: str, user_age_group: str, user_gender: str = None, session_id: str = None) -> ChatResponse:
-    # Kiểm tra sự phù hợp của nội dung
-    if not is_content_appropriate(message, user_age_group):
-        return ChatResponse(
-            response="Xin lỗi, tôi không thể trả lời câu hỏi này vì nó có thể chứa nội dung không phù hợp.",
-            appropriate=False,
-            is_sex_education_related=True
-        )
+async def process_message_with_langchain(message: str, user_age_group: str, user_gender: str = None, session_id: str = None, use_history: bool = True) -> ChatResponse:
     
     try:
         # Kiểm tra API key
@@ -383,8 +434,8 @@ async def process_message_with_langchain(message: str, user_age_group: str, user
                 is_sex_education_related=True
             )
         
-        # Phân loại tin nhắn
-        message_classification = await classify_message_type(message)
+        # Phân loại tin nhắn với lịch sử chat nếu có
+        message_classification = await classify_message_type(message, session_id, use_history)
         is_sex_ed_related = message_classification["is_sex_education_related"]
         is_greeting = message_classification["is_greeting"]
         
@@ -401,7 +452,6 @@ async def process_message_with_langchain(message: str, user_age_group: str, user
                 is_sex_education_related=False
             )
         
-        # Tiếp tục xử lý các câu hỏi về giáo dục giới tính như cũ
         # Khởi tạo LLM với mô hình GPT-4o-mini
         llm = ChatOpenAI(
             openai_api_key=OPENAI_API_KEY,
@@ -417,17 +467,31 @@ async def process_message_with_langchain(message: str, user_age_group: str, user
         else:
             memory = ConversationBufferMemory(return_messages=True)
         
-        # Tạo prompt template dựa trên nhóm tuổi và giới tính người dùng
+        # Lấy lịch sử chat nếu được yêu cầu và có session_id
+        chat_history_text = ""
+        if use_history and session_id and session_id in chat_histories and len(chat_histories[session_id]) > 0:
+            chat_history_text = "Lịch sử hội thoại gần đây:\n"
+            for idx, entry in enumerate(chat_histories[session_id]):
+                chat_history_text += f"Người dùng: {entry.user_message}\n"
+                chat_history_text += f"Chatbot: {entry.bot_response}\n\n"
+        
+        # Tạo prompt template với lịch sử chat nếu có
         if user_gender and user_gender in ["male", "female"]:
-            prompt_template = PromptTemplate(
-                input_variables=["question"],
-                template=age_gender_prompts[user_age_group][user_gender]
-            )
+            base_template = age_gender_prompts[user_age_group][user_gender]
         else:
-            prompt_template = PromptTemplate(
-                input_variables=["question"],
-                template=age_gender_prompts[user_age_group]["default"]
-            )
+            base_template = age_gender_prompts[user_age_group]["default"]
+        
+        # Thêm lịch sử chat vào prompt nếu có
+        if chat_history_text:
+            final_template = f"{base_template}\n\n{chat_history_text}\nCâu hỏi mới: {{question}}"
+        else:
+            final_template = base_template
+        
+        # Tạo prompt template
+        prompt_template = PromptTemplate(
+            input_variables=["question"],
+            template=final_template
+        )
         
         # Tạo chain
         chain = LLMChain(
@@ -453,16 +517,39 @@ async def process_message_with_langchain(message: str, user_age_group: str, user
             is_sex_education_related=True
         )
 
-
-# API endpoint để xử lý tin nhắn chat
+# 3. Cập nhật endpoint chat để hỗ trợ sử dụng lịch sử chat
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     # Kiểm tra độ tuổi hợp lệ
     if request.user_age_group not in ["child", "teen", "adult", "parent"]:
         raise HTTPException(status_code=400, detail="Độ tuổi không hợp lệ. Vui lòng chọn một trong các giá trị: child, teen, adult, parent")
     
+    # Xác định có sử dụng lịch sử chat không
+    use_history = request.use_history if hasattr(request, 'use_history') else True
+    
     # Xử lý tin nhắn và trả về câu trả lời sử dụng LangChain và GPT-4o-mini
-    return await process_message_with_langchain(request.message, request.user_age_group, request.user_gender, request.session_id)
+    response = await process_message_with_langchain(
+        message=request.message, 
+        user_age_group=request.user_age_group, 
+        user_gender=request.user_gender, 
+        session_id=request.session_id,
+        use_history=use_history
+    )
+    
+    # Lưu vào lịch sử chat nếu có session_id
+    if request.session_id:
+        chat_histories[request.session_id].append(
+            ChatHistoryEntry(
+                timestamp=datetime.now().isoformat(),
+                user_message=request.message,
+                bot_response=response.response,
+                user_age_group=request.user_age_group,
+                user_gender=request.user_gender
+            )
+        )
+    
+    return response
+
 
 # API endpoint để lấy danh sách các nhóm tuổi
 @app.get("/age-groups", response_model=List[str])
@@ -519,4 +606,4 @@ app.add_middleware(
 
 
 if __name__ == "__main__":
-    uvicorn.run("test:app", host="0.0.0.0", port=8800, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=8800, reload=False)

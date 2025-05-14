@@ -13,8 +13,8 @@ langchain-community
 mysql-connector-python
 openai
 langchain_openai
-
-
+tiktoken
+gspread
 uvicorn[standard]
 pydantic
 python-dotenv
