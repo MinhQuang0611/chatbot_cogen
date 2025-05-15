@@ -39,9 +39,6 @@ app.add_middleware(
 chat_histories = defaultdict(lambda: deque(maxlen=3))
 
 # Định nghĩa các model dữ liệu
-class ChatMessage(BaseModel):
-    role: str
-    content: str
 
 class ChatHistoryEntry(BaseModel):
     timestamp: str
@@ -50,11 +47,19 @@ class ChatHistoryEntry(BaseModel):
     user_age_group: str
     user_gender: str
 
+class ChatHistoryResponse(BaseModel):
+    session_id : str
+    history: List[ChatHistoryEntry]
+
+class SessionListResponse(BaseModel):
+    total_sessions: int
+    session_ids: List[str]
+    sessions_info: List[Dict[str, Any]]
+
 class ChatRequest(BaseModel):
     message: str
     user_age_group: str  # 'child', 'teen', 'adult', 'parent'
     user_gender: Literal["male", "female"]
-    context: Optional[List[Dict[str, str]]] = []
     session_id: Optional[str] = None
     use_history: Optional[bool] = True
 
@@ -551,6 +556,51 @@ async def chat(request: ChatRequest):
     return response
 
 
+@app.get("/chat-history/{session_id}", response_model=ChatHistoryResponse)
+async def get_chat_history(session_id: str):
+    if session_id in chat_histories and len(chat_histories[session_id]) > 0:
+        history_entries = list(chat_histories[session_id])
+        return ChatHistoryResponse(
+            session_id=session_id,
+            history=history_entries
+        )
+    else:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Không tìm thấy lịch sử trò chuyện cho session {session_id} hoặc lịch sử trống"
+        )
+    
+
+@app.get("/sessions", response_model=SessionListResponse)
+async def get_sessions():
+    session_ids = list(chat_histories.keys())
+    
+    # Tạo thông tin chi tiết cho mỗi session
+    sessions_info = []
+    for session_id in session_ids:
+        if session_id in chat_histories and len(chat_histories[session_id]) > 0:
+            first_entry = chat_histories[session_id][0]
+            last_entry = chat_histories[session_id][-1]
+            
+            # Tính số lượng tin nhắn
+            message_count = len(chat_histories[session_id])
+            
+            sessions_info.append({
+                "session_id": session_id,
+                "first_timestamp": first_entry.timestamp,
+                "last_timestamp": last_entry.timestamp,
+                "message_count": message_count,
+                "user_age_group": last_entry.user_age_group,
+                "user_gender": last_entry.user_gender
+            })
+    
+    return SessionListResponse(
+        total_sessions=len(session_ids),
+        session_ids=session_ids,
+        sessions_info=sessions_info
+    )
+
+
 # API endpoint để lấy danh sách các nhóm tuổi
 @app.get("/age-groups", response_model=List[str])
 async def get_age_groups():
@@ -589,6 +639,8 @@ async def root():
             {"path": "/chat", "method": "POST", "description": "Gửi tin nhắn và nhận câu trả lời"},
             {"path": "/age-groups", "method": "GET", "description": "Lấy danh sách các nhóm tuổi"},
             {"path": "/clear-memory/{session_id}", "method": "DELETE", "description": "Xóa bộ nhớ hội thoại cho một session"},
+            {"path": "/chat-history/{session_id}", "method": "GET", "description": "Lấy lịch sử trò chuyện theo session_id"},
+            {"path": "/sessions", "method": "GET", "description": "Lấy danh sách các session ID hiện có"},
             {"path": "/health", "method": "GET", "description": "Kiểm tra trạng thái hoạt động của API"},
             {"path": "/docs", "method": "GET", "description": "Tài liệu API tự động tạo"}
         ]
